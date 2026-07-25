@@ -25,6 +25,9 @@ class Settings:
     port: int = 5000
     login: str = ""
     scopes: str = ""
+    push_token: str = ""
+    push_login: str = ""
+    push_scopes: str = ""
     local_root: Path | None = None
     json_response: bool = True
     verbose: bool = True

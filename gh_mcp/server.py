@@ -50,10 +50,17 @@ def build_server(settings: Settings, github: GitHubClient) -> FastMCP:
     mcp = FastMCP(
         "github",
         instructions=(
-            "Create and manage GitHub repositories for the connected user "
-            f"({settings.login or 'unknown'}). Write or delete multiple files in one "
-            "atomic commit with push_files. Repo arguments accept 'owner/name' or a "
-            "bare 'name' owned by the connected user."
+            f"Create and manage GitHub repositories owned by {settings.login or 'the owner account'}. "
+            "Write or delete multiple files in one atomic commit with push_files. "
+            "Repo arguments accept 'owner/name' or a bare 'name' owned by the owner account."
+            + (
+                f" Commits, branches, PRs and issues are made by the separate push "
+                f"account {settings.push_login or '(machine account)'}; it needs "
+                f"collaborator write access on a repo before it can commit there, "
+                f"which grant_push_access sets up."
+                if settings.push_token
+                else ""
+            )
         ),
         stateless_http=True,
         json_response=settings.json_response,
@@ -99,9 +106,14 @@ def build_server(settings: Settings, github: GitHubClient) -> FastMCP:
 
     @tool
     async def whoami() -> dict:
-        """Show which GitHub account this server is acting as, and its token scopes."""
+        """Show the identities this server uses.
+
+        'owner' is the account that owns the repos and performs all reads.
+        'pusher' is the account that makes commits, branches, PRs and issues —
+        when a separate push token is configured, commits are authored by it.
+        """
         user = await github.authenticate()
-        return {
+        owner = {
             "login": user.get("login"),
             "name": user.get("name"),
             "type": user.get("type"),
@@ -110,6 +122,46 @@ def build_server(settings: Settings, github: GitHubClient) -> FastMCP:
             "token_scopes": github.scopes or "fine-grained token (no classic scopes)",
             "profile": user.get("html_url"),
         }
+        if not github.split_identity:
+            return {"owner": owner, "pusher": owner, "split_identity": False}
+
+        bot = await github.authenticate_push()
+        return {
+            "owner": owner,
+            "pusher": {
+                "login": (bot or {}).get("login"),
+                "name": (bot or {}).get("name"),
+                "type": (bot or {}).get("type"),
+                "token_scopes": github.push_scopes
+                or "fine-grained token (no classic scopes)",
+                "profile": (bot or {}).get("html_url"),
+            },
+            "split_identity": True,
+            "note": (
+                "Commits, branches, PRs and issues are made by the pusher account; "
+                "reads and repo creation/deletion by the owner account. The pusher "
+                "needs collaborator write access — use grant_push_access."
+            ),
+        }
+
+    @tool
+    async def grant_push_access(repo: str, permission: str = "push") -> dict:
+        """Give the push account write access to one of the owner's repos.
+
+        Invites it as a collaborator using the owner token, then accepts the
+        invitation using the push token, so no manual step is needed. Run this once
+        per repository before the push account can commit to it.
+
+        Args:
+            repo: 'owner/name' or a bare repo name owned by the owner account.
+            permission: 'push' (write, default), 'maintain', 'triage' or 'admin'.
+        """
+        if not github.split_identity:
+            raise ValueError(
+                "no separate push token configured; start the server with "
+                "--push-token to use a machine account"
+            )
+        return await github.grant_push_access(repo, permission)
 
     @tool
     async def list_repos(
@@ -238,10 +290,10 @@ def build_server(settings: Settings, github: GitHubClient) -> FastMCP:
 
         Handles empty repositories, creates the branch if it does not exist, and
         never force-pushes. Existing files are overwritten, everything else is left
-        untouched.
+        untouched. The commit is made by the push account when one is configured.
 
         Args:
-            repo: 'owner/name' or a bare repo name owned by the connected user.
+            repo: 'owner/name' or a bare repo name owned by the owner account.
             files: Files to write. Use encoding='base64' for binary content.
             message: Commit message.
             branch: Target branch. Defaults to the repository's default branch.
