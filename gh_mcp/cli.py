@@ -70,18 +70,30 @@ def verify_token(token: str) -> tuple[dict, str]:
     return response.json(), response.headers.get("x-oauth-scopes", "")
 
 
+def ask_hidden(prompt_lines: list[str]) -> str:
+    for line in prompt_lines:
+        print(line)
+    try:
+        value = getpass.getpass("  > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(130)
+    print()
+    return value
+
+
 def prompt_token(preset: str | None) -> tuple[str, dict, str]:
+    """Owner token: required. Loops until GitHub accepts it."""
     token = preset
     for attempt in range(4):
         if not token:
-            print(bold("  GitHub token") + dim("  (input hidden — paste and press Enter)"))
-            print(dim("  needs 'repo' scope; add 'delete_repo' to allow deletions"))
-            try:
-                token = getpass.getpass("  > ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                sys.exit(130)
-            print()
+            token = ask_hidden(
+                [
+                    bold("  1. Owner token") + dim("   your account — reads your repos"),
+                    dim("     needs 'repo'; add 'delete_repo' to allow deletions"),
+                    dim("     input is hidden — paste and press Enter"),
+                ]
+            )
         if not token:
             print(red("  no token entered"))
             continue
@@ -96,6 +108,36 @@ def prompt_token(preset: str | None) -> tuple[str, dict, str]:
                 break
     print(red("  giving up after too many failed attempts"))
     sys.exit(1)
+
+
+def prompt_push_token(preset: str | None, skip: bool) -> tuple[str, dict | None, str]:
+    """Push token: optional. Blank means one identity for everything."""
+    if skip:
+        return "", None, ""
+    token = preset
+    for attempt in range(3):
+        if not token:
+            token = ask_hidden(
+                [
+                    bold("  2. Push token")
+                    + dim("    machine account — makes the commits"),
+                    dim("     needs 'repo'; leave blank to commit as the owner account"),
+                ]
+            )
+        if not token:
+            return "", None, ""
+        try:
+            user, scopes = verify_token(token)
+            return token, user, scopes
+        except Exception as exc:
+            print(red(f"  {exc}"))
+            print()
+            token = None
+            if attempt >= 1:
+                break
+    print(yellow("  !") + dim(" continuing without a push token"))
+    print()
+    return "", None, ""
 
 
 def lan_ip() -> str | None:
@@ -156,9 +198,19 @@ def print_handoff(settings: Settings, tool_names: list[str]) -> None:
         print(f"    {dim(line)}")
     print()
     print(
-        bold("  Account   ")
-        + f"{settings.login}  {dim('scopes: ' + (settings.scopes or 'fine-grained'))}"
+        bold("  Owner     ")
+        + f"{settings.login}  {dim('reads + repo create/delete')}"
     )
+    if settings.push_token and settings.push_login != settings.login:
+        print(
+            bold("  Pusher    ")
+            + f"{settings.push_login}  {dim('commits, branches, PRs, issues')}"
+        )
+        print(
+            dim("            run grant_push_access once per repo to invite it")
+        )
+    else:
+        print(bold("  Pusher    ") + f"{settings.login}  {dim('same account')}")
     print(bold("  Tools     ") + dim(f"{len(tool_names)}: " + ", ".join(tool_names)))
     if settings.local_root:
         print(bold("  Local push") + f"  enabled from {settings.local_root}")
@@ -197,6 +249,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="GitHub token (otherwise prompted for, hidden)",
     )
     parser.add_argument(
+        "--push-token",
+        default=os.environ.get("GITHUB_PUSH_TOKEN") or os.environ.get("GH_PUSH_TOKEN"),
+        help="token of a machine account that will make the commits",
+    )
+    parser.add_argument(
+        "--no-push-token",
+        action="store_true",
+        help="skip the push-token prompt; commit as the owner account",
+    )
+    parser.add_argument(
         "--local-root",
         default=os.environ.get("LOCAL_ROOT"),
         help="allow push_local_path to read files under this directory",
@@ -219,10 +281,26 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
 
     token, user, scopes = prompt_token(args.token)
-    print(green("  ✓") + f" authenticated as {bold(user.get('login', '?'))}")
+    print(green("  ✓") + f" owner: {bold(user.get('login', '?'))}")
     if scopes and "repo" not in scopes:
         print(yellow("  !") + dim(f" token scopes are '{scopes}' — repo writes may fail"))
     print()
+
+    push_token, push_user, push_scopes = prompt_push_token(args.push_token, args.no_push_token)
+    if push_user:
+        if push_user.get("login") == user.get("login"):
+            print(
+                yellow("  !")
+                + " push token belongs to the same account — commits will not be split"
+            )
+        else:
+            print(green("  ✓") + f" pusher: {bold(push_user.get('login', '?'))}")
+            if push_scopes and "repo" not in push_scopes:
+                print(
+                    yellow("  !")
+                    + dim(f" push token scopes are '{push_scopes}' — commits may fail")
+                )
+        print()
 
     local_root = Path(args.local_root).expanduser().resolve() if args.local_root else None
     if local_root and not local_root.is_dir():
@@ -236,15 +314,20 @@ def main(argv: list[str] | None = None) -> None:
         port=args.port,
         login=user.get("login", ""),
         scopes=scopes,
+        push_token=push_token,
+        push_login=(push_user or {}).get("login", ""),
+        push_scopes=push_scopes,
         local_root=local_root,
         json_response=not args.sse,
         verbose=not args.quiet,
         color=COLOR,
     )
 
-    github = GitHubClient(token)
+    github = GitHubClient(token, push_token=push_token or None)
     github.login = settings.login
     github.scopes = scopes
+    github.push_login = settings.push_login
+    github.push_scopes = push_scopes
 
     mcp = build_server(settings, github)
     app = PasscodeGate(

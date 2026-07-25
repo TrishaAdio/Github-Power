@@ -14,11 +14,18 @@ behalf. The token never leaves your machine.
 ```
   GitHub MCP v1.0.0
 
-  GitHub token  (input hidden — paste and press Enter)
-  needs 'repo' scope; add 'delete_repo' to allow deletions
+  1. Owner token   your account — reads your repos
+     needs 'repo'; add 'delete_repo' to allow deletions
+     input is hidden — paste and press Enter
   > ****************************************
 
-  ✓ authenticated as your-name
+  ✓ owner: your-name
+
+  2. Push token    machine account — makes the commits
+     needs 'repo'; leave blank to commit as the owner account
+  > ****************************************
+
+  ✓ pusher: your-bot
 
 ──────────────────────────────────────────────────────────────
   AI PASSCODE   ph48-errj-czza-xw4r
@@ -35,6 +42,38 @@ Every tool call the AI makes is logged in that terminal, so you can watch what i
 Get a token at <https://github.com/settings/tokens> — classic token with `repo`
 (add `delete_repo` if you want `delete_repo` to work), or a fine-grained token with
 Contents, Metadata, Pull requests and Issues read/write on the target repos.
+
+## Two accounts: read as you, commit as a bot
+
+Give it a second token and the two identities are kept strictly separate:
+
+| Operation | Token used |
+| --- | --- |
+| `whoami`, `list_repos`, `get_repo`, `read_file`, `list_files`, `list_branches` | **owner** |
+| `create_repo`, `delete_repo` (repos must belong to you) | **owner** |
+| `push_files`, `delete_files`, `create_branch` | **push** |
+| `create_pull_request`, `create_issue` | **push** |
+
+So your repos stay yours and the AI can see all of them, while every commit, branch
+and PR is authored by the machine account. Nothing is written with the owner token
+except creating/deleting a repository.
+
+The push account needs write access to a repo before it can commit there. Run this
+once per repo and it invites *and* accepts for you:
+
+```
+grant_push_access(repo="my-app")
+->  { "push_account": "your-bot", "invitation_sent": true,
+      "invitation_accepted": true, "status": "ready" }
+```
+
+If it isn't set up, writes fail with a message that says exactly that rather than a
+bare `404`.
+
+Use a **machine account** for the push token. GitHub allows one bot account per
+person for automation; a second *personal* free account is against their Terms.
+Splitting tokens changes attribution, not behaviour — if the activity itself looks
+abusive, both accounts get flagged.
 
 ## Give the passcode to the AI
 
@@ -72,7 +111,8 @@ without the passcode.
 
 | Tool | What it does |
 | --- | --- |
-| `whoami` | Which account the server acts as, plus token scopes |
+| `whoami` | Both identities (owner + pusher) and their token scopes |
+| `grant_push_access` | Invite the push account to a repo and auto-accept it |
 | `list_repos` | Repos for the account, newest activity first |
 | `create_repo` | New repo (private by default, optional org, gitignore, license) |
 | `get_repo` | Default branch, visibility, size, topics |
@@ -112,13 +152,16 @@ brand-new empty repo, and leaves files it wasn't told about alone.
 --port 5000            port to listen on
 --host 0.0.0.0         bind address (127.0.0.1 to stay local-only)
 --passcode CODE        fixed passcode instead of a generated one
---token TOKEN          skip the prompt (or set GITHUB_TOKEN)
+--token TOKEN          owner token, skips prompt 1 (or set GITHUB_TOKEN)
+--push-token TOKEN     machine-account token, skips prompt 2 (or GITHUB_PUSH_TOKEN)
+--no-push-token        don't ask for a push token; commit as the owner
 --local-root DIR       allow push_local_path to read files under DIR
 --sse                  stream SSE responses instead of JSON
 --quiet                stop logging tool calls
 ```
 
-Environment equivalents: `PORT`, `HOST`, `AI_PASSCODE`, `GITHUB_TOKEN`, `LOCAL_ROOT`.
+Environment equivalents: `PORT`, `HOST`, `AI_PASSCODE`, `GITHUB_TOKEN`,
+`GITHUB_PUSH_TOKEN`, `LOCAL_ROOT`.
 
 ## Notes on safety
 
@@ -136,4 +179,6 @@ Environment equivalents: `PORT`, `HOST`, `AI_PASSCODE`, `GITHUB_TOKEN`, `LOCAL_R
 
 Runs a real MCP client against the server backed by a stub GitHub API: auth gate,
 tool schemas, first commit into an empty repo, updates, binary files, deletions,
-branches and PRs. No token or internet needed.
+branches, PRs, and the two-token routing (the stub records which token made every
+call and the test asserts no git write ever used the owner token). No token or
+internet needed.

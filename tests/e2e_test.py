@@ -15,7 +15,7 @@ import httpx
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -31,9 +31,29 @@ def sha(data: str) -> str:
     return hashlib.sha1(data.encode()).hexdigest()
 
 
+OWNER_TOKEN = "owner-token"
+PUSH_TOKEN = "push-token"
+# Records "<identity> <METHOD> <path>" for every stub call, so the test can assert
+# which token was used for which operation.
+CALLS: list[str] = []
+COLLABORATORS: set[tuple[str, str]] = set()
+INVITATIONS: list[dict] = []
+
+
+def identity(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    if auth.endswith(PUSH_TOKEN):
+        return "pusher"
+    if auth.endswith(OWNER_TOKEN):
+        return "owner"
+    return "unknown"
+
+
 async def stub(request: Request):
     path = "/" + request.path_params["rest"]
     method = request.method
+    who = identity(request)
+    CALLS.append(f"{who} {method} {path}")
     body = {}
     if method in ("POST", "PATCH", "PUT"):
         try:
@@ -43,10 +63,24 @@ async def stub(request: Request):
     parts = [p for p in path.split("/") if p]
 
     if path == "/user":
+        login = "octobot" if who == "pusher" else "octotest"
         return JSONResponse(
-            {"login": "octotest", "name": "Octo Test", "type": "User", "html_url": "u"},
+            {"login": login, "name": login.title(), "type": "User", "html_url": "u"},
             headers={"x-oauth-scopes": "repo, delete_repo"},
         )
+
+    if path == "/user/repository_invitations":
+        if method == "GET":
+            return JSONResponse(INVITATIONS)
+
+    if path.startswith("/user/repository_invitations/") and method == "PATCH":
+        invitation_id = int(parts[-1])
+        remaining = [i for i in INVITATIONS if i["id"] != invitation_id]
+        accepted = [i for i in INVITATIONS if i["id"] == invitation_id]
+        INVITATIONS[:] = remaining
+        for i in accepted:
+            COLLABORATORS.add((i["repository"]["full_name"], "octobot"))
+        return Response(status_code=204)
 
     if path == "/user/repos" and method == "POST":
         full = f"octotest/{body['name']}"
@@ -71,10 +105,32 @@ async def stub(request: Request):
         if full not in STATE["repos"]:
             return JSONResponse({"message": "Not Found"}, status_code=404)
 
+        # Owner invites the push account as a collaborator.
+        if rest[:1] == ["collaborators"] and method == "PUT":
+            invitee = rest[1]
+            if (full, invitee) in COLLABORATORS:
+                return Response(status_code=204)
+            invitation = {
+                "id": 42,
+                "repository": {"full_name": full},
+                "invitee": {"login": invitee},
+                "permissions": body.get("permission", "push"),
+            }
+            INVITATIONS.append(invitation)
+            return JSONResponse(invitation, status_code=201)
+
+        # The push account may only write where it has been granted access.
+        if (
+            who == "pusher"
+            and method in ("POST", "PATCH", "PUT", "DELETE")
+            and (full, "octobot") not in COLLABORATORS
+        ):
+            return JSONResponse({"message": "Not Found"}, status_code=404)
+
         if not rest:
             if method == "DELETE":
                 STATE["repos"].pop(full)
-                return JSONResponse({}, status_code=204)
+                return Response(status_code=204)
             return JSONResponse(STATE["repos"][full])
 
         if rest[:2] == ["git", "ref"]:  # git/ref/heads/<branch>
@@ -204,9 +260,18 @@ from mcp.client.streamable_http import streamablehttp_client  # noqa: E402
 
 PASSCODE = generate_passcode()
 
-settings = Settings(token="fake", passcode=PASSCODE, port=MCP_PORT, login="octotest", verbose=False)
-gh = ghmod.GitHubClient("fake")
+settings = Settings(
+    token=OWNER_TOKEN,
+    passcode=PASSCODE,
+    port=MCP_PORT,
+    login="octotest",
+    push_token=PUSH_TOKEN,
+    push_login="octobot",
+    verbose=False,
+)
+gh = ghmod.GitHubClient(OWNER_TOKEN, push_token=PUSH_TOKEN)
 gh.login = "octotest"
+gh.push_login = "octobot"
 app = PasscodeGate(build_server(settings, gh).streamable_http_app(), PASSCODE)
 
 failures: list[str] = []
@@ -260,7 +325,7 @@ async def main():
             await session.initialize()
             tools = (await session.list_tools()).tools
             check("header passcode accepted", True)
-            check("tools registered", len(tools) == 14,
+            check("tools registered", len(tools) == 15,
                   f"{len(tools)}: {', '.join(sorted(t.name for t in tools))}")
 
             schema = next(t for t in tools if t.name == "push_files").inputSchema
@@ -280,11 +345,46 @@ async def main():
             await session.initialize()
 
             me = await call(session, "whoami", {})
-            check("url-path passcode + whoami", me.get("login") == "octotest", json.dumps(me)[:90])
+            check(
+                "whoami reports both identities",
+                me.get("owner", {}).get("login") == "octotest"
+                and me.get("pusher", {}).get("login") == "octobot"
+                and me.get("split_identity") is True,
+                json.dumps(me)[:120],
+            )
 
             repo = await call(session, "create_repo",
                               {"name": "demo", "private": True, "description": "hi", "auto_init": False})
             check("create_repo", repo.get("full_name") == "octotest/demo", json.dumps(repo)[:110])
+            check(
+                "repo created by OWNER token",
+                "owner POST /user/repos" in CALLS and "pusher POST /user/repos" not in CALLS,
+            )
+
+            # Before access is granted the push account must fail with a clear message.
+            denied = await call(session, "push_files", {
+                "repo": "demo", "message": "too early",
+                "files": [{"path": "x.txt", "content": "x"}]})
+            check(
+                "push blocked until access granted",
+                "__error__" in denied and "grant_push_access" in denied["__error__"],
+                json.dumps(denied)[:150],
+            )
+
+            granted = await call(session, "grant_push_access", {"repo": "demo"})
+            check(
+                "grant_push_access invites and accepts",
+                granted.get("push_account") == "octobot"
+                and granted.get("invitation_sent") is True
+                and granted.get("invitation_accepted") is True
+                and granted.get("status") == "ready",
+                json.dumps(granted)[:170],
+            )
+            check(
+                "invite sent by owner, accepted by pusher",
+                "owner PUT /repos/octotest/demo/collaborators/octobot" in CALLS
+                and "pusher PATCH /user/repository_invitations/42" in CALLS,
+            )
 
             push = await call(session, "push_files", {
                 "repo": "demo",
@@ -358,6 +458,24 @@ async def main():
                 "repo": "demo", "branch": "ghost", "create_branch": False, "message": "x",
                 "files": [{"path": "a.txt", "content": "a"}]})
             check("create_branch=false respected", "__error__" in nobranch, json.dumps(nobranch)[:120])
+
+    # ---- identity routing over the whole session
+    writes = [c for c in CALLS if c.split()[1] in ("POST", "PATCH", "DELETE")]
+    git_writes = [c for c in writes if "/git/" in c or "/pulls" in c]
+    check(
+        "all git/PR writes used the PUSH token",
+        git_writes and all(c.startswith("pusher ") for c in git_writes),
+        f"{len(git_writes)} calls, offenders: "
+        + (", ".join(c for c in git_writes if not c.startswith("pusher ")) or "none"),
+    )
+    # The pusher token may only touch /user (its own identity) and its invitations.
+    allowed_pusher_reads = ("/user", "/user/repository_invitations")
+    stray = [
+        c
+        for c in CALLS
+        if c.startswith("pusher ") and c.split()[1] == "GET" and c.split()[2] not in allowed_pusher_reads
+    ]
+    check("pusher token never reads repo data", not stray, ", ".join(stray) or "none")
 
     print()
     if failures:

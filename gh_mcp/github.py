@@ -19,25 +19,55 @@ class GitHubError(RuntimeError):
         super().__init__(f"GitHub API {status}: {message}" + (f" ({url})" if url else ""))
 
 
+def _make_client(token: str, timeout: float) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        base_url=API_BASE,
+        timeout=timeout,
+        follow_redirects=True,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "github-mcp/1.0",
+        },
+    )
+
+
 class GitHubClient:
-    def __init__(self, token: str, timeout: float = 30.0) -> None:
+    """Two-identity GitHub client.
+
+    - The **owner** token (your account) is used for reads and for anything that
+      must belong to you: listing/creating/deleting repos, reading files.
+    - The optional **push** token (a machine account) is used for everything that
+      writes git history or opens threads: commits, branches, PRs, issues. Commits
+      are therefore authored by the machine account, not you.
+
+    With no push token the client behaves as a single-identity client.
+    """
+
+    def __init__(
+        self, token: str, *, push_token: str | None = None, timeout: float = 30.0
+    ) -> None:
         self._token = token
-        self._client = httpx.AsyncClient(
-            base_url=API_BASE,
-            timeout=timeout,
-            follow_redirects=True,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "github-mcp/1.0",
-            },
-        )
+        self._client = _make_client(token, timeout)
+        self._push = _make_client(push_token, timeout) if push_token else None
         self.login: str = ""
         self.scopes: str = ""
+        self.push_login: str = ""
+        self.push_scopes: str = ""
+
+    @property
+    def split_identity(self) -> bool:
+        return self._push is not None
+
+    @property
+    def writer_login(self) -> str:
+        return self.push_login or self.login
 
     async def aclose(self) -> None:
         await self._client.aclose()
+        if self._push:
+            await self._push.aclose()
 
     # ------------------------------------------------------------------ core
 
@@ -47,12 +77,26 @@ class GitHubClient:
         path: str,
         *,
         ok404: bool = False,
+        write: bool = False,
         **kwargs: Any,
     ) -> Any:
-        response = await self._client.request(method, path, **kwargs)
+        client = self._push if (write and self._push) else self._client
+        response = await client.request(method, path, **kwargs)
 
         if response.status_code == 404 and ok404:
             return None
+
+        # A machine account that was never invited to the repo sees 403/404 on
+        # writes; say so plainly instead of leaking a bare "Not Found".
+        if write and self._push and response.status_code in (403, 404):
+            raise GitHubError(
+                response.status_code,
+                f"push account '{self.push_login or 'unknown'}' cannot write here — "
+                f"run grant_push_access first, or invite it as a collaborator with "
+                f"write permission",
+                str(response.url),
+            )
+
         if response.status_code >= 400:
             try:
                 payload = response.json()
@@ -102,11 +146,10 @@ class GitHubClient:
 
     # ------------------------------------------------------------------ auth
 
-    async def authenticate(self) -> dict:
-        """Verify the token and cache the login + granted scopes."""
-        response = await self._client.get("/user")
+    async def _whoami(self, client: httpx.AsyncClient, label: str) -> tuple[dict, str]:
+        response = await client.get("/user")
         if response.status_code == 401:
-            raise GitHubError(401, "token rejected (bad or revoked)", "/user")
+            raise GitHubError(401, f"{label} token rejected (bad or revoked)", "/user")
         if response.status_code >= 400:
             raise GitHubError(
                 response.status_code,
@@ -115,10 +158,67 @@ class GitHubClient:
                 else response.reason_phrase,
                 "/user",
             )
-        user = response.json()
+        return response.json(), response.headers.get("x-oauth-scopes", "")
+
+    async def authenticate(self) -> dict:
+        """Verify the owner token and cache its login + granted scopes."""
+        user, scopes = await self._whoami(self._client, "owner")
         self.login = user.get("login", "")
-        self.scopes = response.headers.get("x-oauth-scopes", "")
+        self.scopes = scopes
         return user
+
+    async def authenticate_push(self) -> dict | None:
+        """Verify the push token, if one was configured."""
+        if not self._push:
+            return None
+        user, scopes = await self._whoami(self._push, "push")
+        self.push_login = user.get("login", "")
+        self.push_scopes = scopes
+        return user
+
+    # --------------------------------------------------- collaborator plumbing
+
+    async def grant_push_access(self, repo: str, permission: str = "push") -> dict:
+        """Invite the push account to a repo (as owner) and accept it (as the bot)."""
+        if not self._push:
+            raise GitHubError(400, "no push token configured", "")
+        if not self.push_login:
+            await self.authenticate_push()
+
+        full = await self.resolve_repo(repo)
+        bot = self.push_login
+
+        invited = await self.request(
+            "PUT",
+            f"/repos/{full}/collaborators/{bot}",
+            json={"permission": permission},
+        )
+
+        # An empty body means the account was already a collaborator.
+        pending = bool(invited)
+        accepted = False
+        if pending:
+            invitations = await self.request("GET", "/user/repository_invitations", write=True)
+            for invitation in invitations or []:
+                if invitation.get("repository", {}).get("full_name", "").lower() == full.lower():
+                    await self.request(
+                        "PATCH",
+                        f"/user/repository_invitations/{invitation['id']}",
+                        write=True,
+                    )
+                    accepted = True
+                    break
+
+        return {
+            "repo": full,
+            "push_account": bot,
+            "permission": permission,
+            "invitation_sent": pending,
+            "invitation_accepted": accepted,
+            "status": "ready"
+            if accepted or not pending
+            else "invitation pending — accept it manually as " + bot,
+        }
 
     async def resolve_repo(self, repo: str) -> str:
         """Accept ``owner/name`` or a bare ``name`` (owned by the token user)."""
@@ -210,12 +310,14 @@ class GitHubClient:
             "POST",
             f"/repos/{full}/git/refs",
             json={"ref": f"refs/heads/{branch}", "sha": base["object"]["sha"]},
+            write=True,
         )
         return {
             "repo": full,
             "branch": branch,
             "from_branch": source,
             "sha": ref["object"]["sha"],
+            "acted_as": self.writer_login,
         }
 
     # ----------------------------------------------------------------- files
@@ -229,6 +331,7 @@ class GitHubClient:
         branch: str | None = None,
         create_branch: bool = True,
         delete_paths: Iterable[str] = (),
+        author: dict[str, str] | None = None,
     ) -> dict:
         """Write/delete many paths in a single commit (Git data API)."""
         full = await self.resolve_repo(repo)
@@ -276,6 +379,7 @@ class GitHubClient:
                     "content": base64.b64encode(data).decode(),
                     "encoding": "base64",
                 },
+                write=True,
             )
             tree.append(
                 {
@@ -301,16 +405,19 @@ class GitHubClient:
         tree_payload: dict[str, Any] = {"tree": tree}
         if base_tree:
             tree_payload["base_tree"] = base_tree
-        new_tree = await self.request("POST", f"/repos/{full}/git/trees", json=tree_payload)
+        new_tree = await self.request(
+            "POST", f"/repos/{full}/git/trees", json=tree_payload, write=True
+        )
 
+        commit_payload: dict[str, Any] = {
+            "message": message,
+            "tree": new_tree["sha"],
+            "parents": [parent_sha] if parent_sha else [],
+        }
+        if author:
+            commit_payload["author"] = author
         new_commit = await self.request(
-            "POST",
-            f"/repos/{full}/git/commits",
-            json={
-                "message": message,
-                "tree": new_tree["sha"],
-                "parents": [parent_sha] if parent_sha else [],
-            },
+            "POST", f"/repos/{full}/git/commits", json=commit_payload, write=True
         )
 
         if branch_existed:
@@ -318,12 +425,14 @@ class GitHubClient:
                 "PATCH",
                 f"/repos/{full}/git/refs/heads/{target}",
                 json={"sha": new_commit["sha"], "force": False},
+                write=True,
             )
         else:
             await self.request(
                 "POST",
                 f"/repos/{full}/git/refs",
                 json={"ref": f"refs/heads/{target}", "sha": new_commit["sha"]},
+                write=True,
             )
 
         return {
@@ -335,6 +444,8 @@ class GitHubClient:
             "files_written": written,
             "files_deleted": removed,
             "message": message,
+            "committed_as": (new_commit.get("author") or {}).get("name")
+            or self.writer_login,
         }
 
     async def read_file(self, repo: str, path: str, ref: str | None = None) -> dict:
@@ -445,6 +556,7 @@ class GitHubClient:
                 "body": body,
                 "draft": draft,
             },
+            write=True,
         )
         return {
             "repo": full,
@@ -454,6 +566,7 @@ class GitHubClient:
             "base": base,
             "state": pr["state"],
             "draft": pr.get("draft", False),
+            "opened_by": self.writer_login,
         }
 
     async def create_issue(
@@ -463,10 +576,11 @@ class GitHubClient:
         payload: dict[str, Any] = {"title": title, "body": body}
         if labels:
             payload["labels"] = list(labels)
-        issue = await self.request("POST", f"/repos/{full}/issues", json=payload)
+        issue = await self.request("POST", f"/repos/{full}/issues", json=payload, write=True)
         return {
             "repo": full,
             "number": issue["number"],
             "url": issue["html_url"],
             "state": issue["state"],
+            "opened_by": self.writer_login,
         }
