@@ -254,7 +254,7 @@ ghmod.API_BASE = f"http://127.0.0.1:{STUB_PORT}"
 
 from gh_mcp.auth import PasscodeGate  # noqa: E402
 from gh_mcp.config import Settings, generate_passcode  # noqa: E402
-from gh_mcp.server import build_server  # noqa: E402
+from gh_mcp.server import build_server, transport_security  # noqa: E402
 from mcp import ClientSession  # noqa: E402
 from mcp.client.streamable_http import streamablehttp_client  # noqa: E402
 
@@ -458,6 +458,65 @@ async def main():
                 "repo": "demo", "branch": "ghost", "create_branch": False, "message": "x",
                 "files": [{"path": "a.txt", "content": "a"}]})
             check("create_branch=false respected", "__error__" in nobranch, json.dumps(nobranch)[:120])
+
+    # ---- Host header handling (the 421 Invalid Host header regression)
+    async with httpx.AsyncClient() as h:
+        for label, host_header in (
+            ("public IP", "54.204.234.44:5000"),
+            ("private IP", "172.31.29.21:5000"),
+            ("domain", "mcp.karn.lol"),
+        ):
+            r = await h.post(
+                f"{base}/{PASSCODE}/mcp",
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                headers={
+                    "Host": host_header,
+                    "Accept": "application/json, text/event-stream",
+                    "Content-Type": "application/json",
+                },
+            )
+            check(f"Host: {host_header} accepted ({label})", r.status_code == 200,
+                  f"HTTP {r.status_code} {r.text[:60]}")
+
+    # An explicit allowlist must actually restrict.
+    strict = Settings(
+        token=OWNER_TOKEN, passcode="x", host="0.0.0.0", allowed_hosts=["mcp.karn.lol"]
+    )
+    strict_security = transport_security(strict)
+    check(
+        "--allowed-host enforces an allowlist",
+        strict_security.enable_dns_rebinding_protection
+        and "mcp.karn.lol" in strict_security.allowed_hosts
+        and "mcp.karn.lol:*" in strict_security.allowed_hosts
+        and "localhost" in strict_security.allowed_hosts
+        and "54.204.234.44" not in strict_security.allowed_hosts,
+        ", ".join(strict_security.allowed_hosts),
+    )
+    loopback_security = transport_security(Settings(token="t", passcode="x", host="127.0.0.1"))
+    check(
+        "loopback bind keeps DNS-rebinding protection",
+        loopback_security.enable_dns_rebinding_protection,
+    )
+
+    # ---- header-only auth mode: the passcode must not work in a URL
+    async def echo(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", b"text/plain")]})
+        await send({"type": "http.response.body", "body": b"reached"})
+
+    strict_gate = PasscodeGate(echo, PASSCODE, allow_in_url=False)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=strict_gate), base_url="http://gate"
+    ) as h:
+        r = await h.get(f"/{PASSCODE}/mcp")
+        check("header mode rejects passcode in path", r.status_code == 401, f"HTTP {r.status_code}")
+        r = await h.get(f"/mcp?code={PASSCODE}")
+        check("header mode rejects passcode in query", r.status_code == 401, f"HTTP {r.status_code}")
+        r = await h.get("/mcp", headers={"Authorization": f"Bearer {PASSCODE}"})
+        check("header mode accepts the header", r.status_code == 200 and r.text == "reached",
+              f"HTTP {r.status_code}")
+        r = await h.get("/mcp", headers={"Authorization": "Bearer nope"})
+        check("header mode rejects a wrong header", r.status_code == 401)
 
     # ---- identity routing over the whole session
     writes = [c for c in CALLS if c.split()[1] in ("POST", "PATCH", "DELETE")]

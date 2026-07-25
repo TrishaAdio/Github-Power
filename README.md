@@ -107,6 +107,37 @@ cloudflared tunnel --url http://localhost:5000
 `GET /healthz` is the only unauthenticated route. Everything else returns `401`
 without the passcode.
 
+The four methods are alternatives, not layers — if the passcode is already in the
+URL path, an `Authorization` header adds nothing. To make the header the *only*
+accepted credential, so the passcode never lands in a URL, a browser history or a
+proxy access log:
+
+```bash
+./start.sh --auth-mode header
+```
+
+The URL then becomes plain `/mcp` and `/<passcode>/mcp` returns `401`.
+
+## Exposing it on a public IP or domain
+
+Serving it publicly over plain HTTP means the passcode and all repo content cross
+the internet in the clear. Put it behind the TLS proxy you already run:
+
+```
+mcp.example.com {
+    reverse_proxy 127.0.0.1:5000
+}
+```
+
+```bash
+./start.sh --host 127.0.0.1 --behind-proxy --allowed-host mcp.example.com --auth-mode header
+```
+
+`--allowed-host` also switches the Host check to a strict allowlist (localhost plus
+what you list). With no `--allowed-host` and a non-loopback bind, any Host header is
+accepted — necessary, because the server cannot guess the IP or domain a client will
+use, and the passcode is the real credential either way.
+
 ## Tools the AI gets
 
 | Tool | What it does |
@@ -156,12 +187,15 @@ brand-new empty repo, and leaves files it wasn't told about alone.
 --push-token TOKEN     machine-account token, skips prompt 2 (or GITHUB_PUSH_TOKEN)
 --no-push-token        don't ask for a push token; commit as the owner
 --local-root DIR       allow push_local_path to read files under DIR
+--allowed-host HOST    Host header to accept (repeatable); enables strict checking
+--behind-proxy         trust X-Forwarded-* from Caddy/nginx
+--auth-mode any|header where the passcode may appear (default: any)
 --sse                  stream SSE responses instead of JSON
 --quiet                stop logging tool calls
 ```
 
 Environment equivalents: `PORT`, `HOST`, `AI_PASSCODE`, `GITHUB_TOKEN`,
-`GITHUB_PUSH_TOKEN`, `LOCAL_ROOT`.
+`GITHUB_PUSH_TOKEN`, `LOCAL_ROOT`, `ALLOWED_HOSTS` (comma-separated), `AUTH_MODE`.
 
 ## Notes on safety
 
@@ -177,8 +211,9 @@ Environment equivalents: `PORT`, `HOST`, `AI_PASSCODE`, `GITHUB_TOKEN`,
 ./.venv/bin/python tests/e2e_test.py
 ```
 
-Runs a real MCP client against the server backed by a stub GitHub API: auth gate,
-tool schemas, first commit into an empty repo, updates, binary files, deletions,
-branches, PRs, and the two-token routing (the stub records which token made every
-call and the test asserts no git write ever used the owner token). No token or
-internet needed.
+42 checks against a stub GitHub API, driven by a real MCP client: the auth gate,
+header-only mode, Host header handling (public IP, private IP and domain — the
+`421 Invalid Host header` regression), tool schemas, first commit into an empty
+repo, updates, binary files, deletions, branches, PRs, and the two-token routing
+(the stub records which token made every call and the test asserts no git write
+ever used the owner token). No token or internet needed.

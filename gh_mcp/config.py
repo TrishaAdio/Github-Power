@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Unambiguous alphabet: no 0/o/1/l/i to keep passcodes easy to read out loud.
@@ -32,6 +32,16 @@ class Settings:
     json_response: bool = True
     verbose: bool = True
     color: bool = True
+    # Extra Host header values to accept (the public IP or domain you serve on).
+    allowed_hosts: list[str] = field(default_factory=list)
+    # Trust X-Forwarded-* when sitting behind Caddy/nginx.
+    behind_proxy: bool = False
+    # "any" = passcode via URL path, query or header. "header" = header only.
+    auth_mode: str = "any"
+
+    @property
+    def loopback_only(self) -> bool:
+        return self.host in ("127.0.0.1", "localhost", "::1")
 
     @property
     def mount_path(self) -> str:

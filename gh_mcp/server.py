@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
 
 from .config import Settings
@@ -46,6 +47,36 @@ class FileEntry(BaseModel):
     )
 
 
+def transport_security(settings: Settings) -> TransportSecuritySettings:
+    """Decide how strict the Host/Origin check should be.
+
+    FastMCP turns on DNS-rebinding protection whenever it thinks it is bound to
+    loopback, and its allowlist is then localhost-only — which makes every request
+    that arrives with a real Host header (a public IP or a domain) fail with
+    421 Invalid Host header. So we always set this explicitly:
+
+    - loopback bind, or an explicit --allowed-host list: enforce the allowlist.
+    - public bind with no list: we cannot know the IP/domain the client will use,
+      and the passcode is the actual credential, so accept any Host.
+    """
+    local = ["localhost", "127.0.0.1", "[::1]"]
+    names = local + [h.strip() for h in settings.allowed_hosts if h.strip()]
+
+    hosts: list[str] = []
+    origins: list[str] = []
+    for name in names:
+        hosts += [name, f"{name}:*"]
+        origins += [f"http://{name}", f"http://{name}:*", f"https://{name}"]
+
+    if settings.allowed_hosts or settings.loopback_only:
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=hosts,
+            allowed_origins=origins,
+        )
+    return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+
 def build_server(settings: Settings, github: GitHubClient) -> FastMCP:
     mcp = FastMCP(
         "github",
@@ -65,6 +96,9 @@ def build_server(settings: Settings, github: GitHubClient) -> FastMCP:
         stateless_http=True,
         json_response=settings.json_response,
         log_level="WARNING",  # FastMCP configures the root logger; keep it quiet
+        host=settings.host,
+        port=settings.port,
+        transport_security=transport_security(settings),
     )
     for noisy in ("httpx", "httpcore", "mcp", "uvicorn.access"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

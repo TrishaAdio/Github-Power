@@ -169,30 +169,52 @@ def print_handoff(settings: Settings, tool_names: list[str]) -> None:
         if ip:
             hosts.append(("network", ip))
 
+    for name in settings.allowed_hosts:
+        hosts.append(("public", name))
+
+    def base_url(host: str) -> str:
+        # An --allowed-host that carries no port is assumed to be fronted by a
+        # TLS proxy on 443.
+        if any(host == name for name in settings.allowed_hosts) and ":" not in host:
+            return f"https://{host}"
+        return f"http://{host}:{settings.port}"
+
+    header_only = settings.auth_mode == "header"
+
     rule = dim("─" * 62)
     print(rule)
     print(f"  {bold('AI PASSCODE')}   {green(bold(code))}")
     print(dim("  share this with your AI — anyone holding it can use your token"))
     print(rule)
     print()
-    print(bold("  Endpoint") + dim("  (passcode in the URL — works with any MCP client)"))
-    for label, host in hosts:
-        print(f"    {dim(label + ':'):<12} {cyan(f'http://{host}:{settings.port}/{code}/mcp')}")
-    print()
-    print(bold("  Or send it as a header"))
-    print(f"    {cyan(f'http://{hosts[0][1]}:{settings.port}/mcp')}")
-    print(f"    {dim('Authorization: Bearer')} {code}")
-    print()
 
-    url = f"http://{hosts[-1][1]}:{settings.port}/{code}/mcp"
-    snippet = {
-        "mcpServers": {
-            "github": {
-                "url": url,
-                "headers": {"Authorization": f"Bearer {code}"},
+    if header_only:
+        print(bold("  Endpoint") + dim("  (passcode goes in the header, never the URL)"))
+        for label, host in hosts:
+            print(f"    {dim(label + ':'):<12} {cyan(base_url(host) + '/mcp')}")
+        print(f"    {dim('Authorization: Bearer')} {code}")
+        print()
+        snippet_url = base_url(hosts[-1][1]) + "/mcp"
+        snippet = {
+            "mcpServers": {
+                "github": {
+                    "url": snippet_url,
+                    "headers": {"Authorization": f"Bearer {code}"},
+                }
             }
         }
-    }
+    else:
+        print(bold("  Endpoint") + dim("  (passcode in the URL — works with any MCP client)"))
+        for label, host in hosts:
+            print(f"    {dim(label + ':'):<12} {cyan(base_url(host) + f'/{code}/mcp')}")
+        print()
+        print(bold("  Or send it as a header"))
+        print(f"    {cyan(base_url(hosts[0][1]) + '/mcp')}")
+        print(f"    {dim('Authorization: Bearer')} {code}")
+        print()
+        snippet = {
+            "mcpServers": {"github": {"url": base_url(hosts[-1][1]) + f"/{code}/mcp"}}
+        }
     print(bold("  MCP client config"))
     for line in json.dumps(snippet, indent=2).splitlines():
         print(f"    {dim(line)}")
@@ -212,6 +234,14 @@ def print_handoff(settings: Settings, tool_names: list[str]) -> None:
     else:
         print(bold("  Pusher    ") + f"{settings.login}  {dim('same account')}")
     print(bold("  Tools     ") + dim(f"{len(tool_names)}: " + ", ".join(tool_names)))
+    if settings.allowed_hosts:
+        print(bold("  Host check") + dim("  only: " + ", ".join(settings.allowed_hosts + ["localhost"])))
+    elif settings.loopback_only:
+        print(bold("  Host check") + dim("  localhost only (bound to loopback)"))
+    else:
+        print(bold("  Host check") + dim("  any Host accepted — passcode is the credential"))
+    if settings.behind_proxy:
+        print(bold("  Proxy     ") + dim("  trusting X-Forwarded-* headers"))
     if settings.local_root:
         print(bold("  Local push") + f"  enabled from {settings.local_root}")
     else:
@@ -262,6 +292,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--local-root",
         default=os.environ.get("LOCAL_ROOT"),
         help="allow push_local_path to read files under this directory",
+    )
+    parser.add_argument(
+        "--allowed-host",
+        action="append",
+        default=[
+            h for h in (os.environ.get("ALLOWED_HOSTS", "").split(",")) if h.strip()
+        ],
+        metavar="HOST",
+        help="Host header to accept, e.g. mcp.example.com or 1.2.3.4 (repeatable). "
+        "Omit to accept any Host when bound publicly.",
+    )
+    parser.add_argument(
+        "--behind-proxy",
+        action="store_true",
+        help="trust X-Forwarded-* headers (use when Caddy/nginx fronts this server)",
+    )
+    parser.add_argument(
+        "--auth-mode",
+        choices=("any", "header"),
+        default=os.environ.get("AUTH_MODE", "any"),
+        help="'any': passcode in URL path, query or header. "
+        "'header': header only, so it never appears in a URL or proxy log.",
     )
     parser.add_argument("--sse", action="store_true", help="stream SSE responses instead of JSON")
     parser.add_argument("--quiet", action="store_true", help="do not log tool calls")
@@ -321,6 +373,9 @@ def main(argv: list[str] | None = None) -> None:
         json_response=not args.sse,
         verbose=not args.quiet,
         color=COLOR,
+        allowed_hosts=[h.strip() for h in args.allowed_host if h.strip()],
+        behind_proxy=args.behind_proxy,
+        auth_mode=args.auth_mode,
     )
 
     github = GitHubClient(token, push_token=push_token or None)
@@ -334,12 +389,18 @@ def main(argv: list[str] | None = None) -> None:
         mcp.streamable_http_app(),
         settings.passcode,
         on_reject=lambda info: print(f"  {red('denied')} {dim(info)}", flush=True),
+        allow_in_url=settings.auth_mode == "any",
     )
 
     print_handoff(settings, sorted(t.name for t in mcp._tool_manager.list_tools()))
 
+    serve_kwargs: dict = {"log_level": "warning"}
+    if settings.behind_proxy:
+        serve_kwargs["proxy_headers"] = True
+        serve_kwargs["forwarded_allow_ips"] = "*"
+
     try:
-        uvicorn.run(app, host=settings.host, port=settings.port, log_level="warning")
+        uvicorn.run(app, host=settings.host, port=settings.port, **serve_kwargs)
     except KeyboardInterrupt:
         pass
     finally:

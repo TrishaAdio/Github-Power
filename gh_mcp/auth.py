@@ -31,10 +31,15 @@ def _unauthorized_payload(reason: str) -> bytes:
 class PasscodeGate:
     """Rejects any request that does not carry the shared passcode."""
 
-    def __init__(self, app: Any, passcode: str, on_reject=None) -> None:
+    def __init__(
+        self, app: Any, passcode: str, on_reject=None, allow_in_url: bool = True
+    ) -> None:
         self.app = app
         self.passcode = passcode
         self.on_reject = on_reject
+        # When False, only the headers are accepted: the passcode never appears in
+        # a URL, so it cannot leak through proxy access logs, history or screenshots.
+        self.allow_in_url = allow_in_url
 
     def _matches(self, candidate: str | None) -> bool:
         if not candidate:
@@ -70,7 +75,7 @@ class PasscodeGate:
 
         # 3) Passcode baked into the URL path -> strip it before forwarding.
         prefix = "/" + self.passcode
-        if path == prefix or path.startswith(prefix + "/"):
+        if self.allow_in_url and (path == prefix or path.startswith(prefix + "/")):
             stripped = path[len(prefix) :] or "/"
             scope = dict(scope)
             scope["path"] = stripped
@@ -98,7 +103,7 @@ class PasscodeGate:
                         break
 
             # 4) ?code= / ?passcode= query parameter
-            if not authorized:
+            if not authorized and self.allow_in_url:
                 query = parse_qs(scope.get("query_string", b"").decode())
                 for key in ("code", "passcode", "key"):
                     if key in query:
